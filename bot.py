@@ -1,5 +1,5 @@
-# Telegram Savings Bot
-# Ushbu bot foydalanuvchiga kunlik jamg‘arma kiritish, balans va qolgan summani ko‘rish,
+# Telegram Savings Bot (Final Fixed)
+# Foydalanuvchiga kunlik jamg‘arma kiritish, balans va qolgan summani ko‘rish,
 # hamda valyuta kursini olish imkoniyatini beradi.
 
 import os
@@ -21,9 +21,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     remaining = TARGET_AMOUNT - SAVED_AMOUNT
     await update.message.reply_text(
-        f"🎯 Maqsad: {TARGET_AMOUNT}$
-💵 Jamg‘arilgan: {SAVED_AMOUNT}$
-📉 Qolgan: {remaining}$",
+        f"🎯 Maqsad: {TARGET_AMOUNT}$\n💵 Jamg‘arilgan: {SAVED_AMOUNT}$\n📉 Qolgan: {remaining}$",
         reply_markup=reply_markup
     )
 
@@ -37,16 +35,12 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SAVED_AMOUNT += 10  # vaqtincha har safar 10$ qo‘shadi
         remaining = TARGET_AMOUNT - SAVED_AMOUNT
         await query.edit_message_text(
-            f"✅ Kunlik summa qo‘shildi!
-
-💵 Jamg‘arilgan: {SAVED_AMOUNT}$
-📉 Qolgan: {remaining}$"
+            f"✅ Kunlik summa qo‘shildi!\n\n💵 Jamg‘arilgan: {SAVED_AMOUNT}$\n📉 Qolgan: {remaining}$"
         )
     elif query.data == "balance":
         remaining = TARGET_AMOUNT - SAVED_AMOUNT
         await query.edit_message_text(
-            f"💵 Umumiy balans: {SAVED_AMOUNT}$
-📉 Qolgan: {remaining}$"
+            f"💵 Umumiy balans: {SAVED_AMOUNT}$\n📉 Qolgan: {remaining}$"
         )
     elif query.data == "currency":
         rate = get_usd_to_uzs()

@@ -17,4 +17,3 @@ Bu Telegram boti foydalanuvchiga maqsad qilib qo‘yilgan summani jamg‘arish u
 
 ## Buyruqlar
 - `/start` — botni ishga tushiradi, balans va menyuni ko‘rsatadi.
-
