@@ -9,29 +9,35 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 # Configuration
 DB_PATH = 'data.db'
 DEFAULT_TARGET = 12500000  # so'm (≈ $1000 at 12,500 UZS)
+# We'll store a manual local rate override in settings table 'local_rate' column if set.
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Database helpers ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute('''CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, target INTEGER, start_date TEXT)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, target INTEGER, start_date TEXT, local_rate REAL)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT UNIQUE, amount INTEGER)''')
     cur.execute('SELECT COUNT(*) FROM settings')
     if cur.fetchone()[0] == 0:
-        cur.execute('INSERT INTO settings (target, start_date) VALUES (?, ?)', (DEFAULT_TARGET, date.today().isoformat()))
+        cur.execute('INSERT INTO settings (target, start_date, local_rate) VALUES (?, ?, ?)',
+                    (DEFAULT_TARGET, date.today().isoformat(), NULL_IF_NONE(None)))
     conn.commit()
     conn.close()
+
+def NULL_IF_NONE(x):
+    return x if x is not None else None
 
 def get_settings():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute('SELECT target, start_date FROM settings WHERE id = 1')
+    cur.execute('SELECT target, start_date, local_rate FROM settings WHERE id = 1')
     row = cur.fetchone()
     conn.close()
-    return (row[0], row[1])
+    if row is None:
+        return (DEFAULT_TARGET, date.today().isoformat(), None)
+    return (row[0], row[1], row[2])
 
 def set_target(amount):
     conn = sqlite3.connect(DB_PATH)
@@ -43,6 +49,12 @@ def set_start(start_iso):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('UPDATE settings SET start_date = ? WHERE id = 1', (start_iso,))
+    conn.commit(); conn.close()
+
+def set_local_rate(rate_float):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('UPDATE settings SET local_rate = ? WHERE id = 1', (rate_float,))
     conn.commit(); conn.close()
 
 def add_entry_for(day_iso, amount):
@@ -70,65 +82,79 @@ def get_total():
     conn.close()
     return int(s)
 
-def get_entries_between(start_iso, end_iso):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute('SELECT day, amount FROM entries WHERE day BETWEEN ? AND ? ORDER BY day', (start_iso, end_iso))
-    rows = cur.fetchall(); conn.close()
-    return rows
-
-# --- Utility ---
-def is_sunday(d: date):
-    return d.weekday() == 6
-
-def working_days_between(start_iso, end_iso):
-    s = date.fromisoformat(start_iso)
-    e = date.fromisoformat(end_iso)
-    cnt = 0
-    while s <= e:
-        if not is_sunday(s):
-            cnt += 1
-        s += timedelta(days=1)
-    return cnt
-
-def fetch_usd_rate():
-    """Return USD per 1 UZS (i.e. USD = UZS * rate)."""
+# --- Exchange rate helpers: try multiple public APIs, fallback to local override ---
+def fetch_rate_from_exchangerate_host():
     try:
-        resp = requests.get('https://api.exchangerate.host/latest', params={'base': 'UZS', 'symbols': 'USD'}, timeout=10)
-        data = resp.json()
-        rate = data.get('rates', {}).get('USD')
-        if rate:
-            return float(rate)  # USD per UZS (small number)
+        r = requests.get('https://api.exchangerate.host/latest', params={'base': 'USD', 'symbols': 'UZS'}, timeout=8)
+        data = r.json()
+        val = data.get('rates', {}).get('UZS')
+        if val:  # val is UZS per 1 USD
+            return float(val)
     except Exception as e:
-        logger.warning('fetch_usd_rate failed: %s', e)
+        logger.debug('exchangerate.host failed: %s', e)
     return None
+
+def fetch_rate_from_erapi():
+    try:
+        r = requests.get('https://open.er-api.com/v6/latest/USD', timeout=8)
+        data = r.json()
+        val = data.get('rates', {}).get('UZS')
+        if val:
+            return float(val)
+    except Exception as e:
+        logger.debug('er-api failed: %s', e)
+    return None
+
+def fetch_rate_from_frankfurter():
+    try:
+        r = requests.get('https://api.frankfurter.app/latest', params={'from': 'USD', 'to': 'UZS'}, timeout=8)
+        data = r.json()
+        val = data.get('rates', {}).get('UZS')
+        if val:
+            return float(val)
+    except Exception as e:
+        logger.debug('frankfurter failed: %s', e)
+    return None
+
+def get_best_rate():
+    # Check local override first
+    _, _, local = get_settings()
+    if local is not None:
+        return float(local), 'manual (local override)'
+    # Try APIs in order
+    for fn in (fetch_rate_from_exchangerate_host, fetch_rate_from_erapi, fetch_rate_from_frankfurter):
+        try:
+            v = fn()
+            if v:
+                return v, fn.__name__
+        except Exception:
+            continue
+    return None, 'none'
 
 def fmt(n):
     return '{:,}'.format(int(n))
 
-# --- Keyboards ---
+# Keyboards
 def main_keyboard():
     kb = [
         [InlineKeyboardButton("➕ Kunlik summa qo'shish", callback_data='add_daily')],
         [InlineKeyboardButton("💰 Umumiy balans", callback_data='balance'), InlineKeyboardButton("💱 Valyuta kursi", callback_data='rate')],
-        [InlineKeyboardButton("📄 Reja (PDF, 1 yil)", callback_data='plan_pdf')]
+        [InlineKeyboardButton("📄 Reja (PDF, 1 yil)", callback_data='plan_pdf')],
     ]
     return InlineKeyboardMarkup(kb)
 
 def back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Bosh menyuga qaytish", callback_data='back_main')]])
 
-# --- Handlers ---
+# Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
-    target, start_iso = get_settings()
+    target, start_iso, local = get_settings()
     total = get_total()
     rem = max(0, target - total)
-    rate = fetch_usd_rate()
-    usd_rem = rem * rate if rate else None
-    usd_per_usd = (1 / rate) if rate else None
+    rate, src = get_best_rate()
+    usd_rem = (rem / rate) if rate else None  # rem in UZS -> USD
     today = date.today().isoformat()
-    # today's saved
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
     cur.execute('SELECT amount FROM entries WHERE day = ?', (today,))
     r = cur.fetchone(); conn.close()
@@ -136,7 +162,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = f"🎯 Maqsad (so'm): {fmt(target)}\n💵 Jami yig'ilgan: {fmt(total)} so'm\n📉 Qolgan: {fmt(rem)} so'm"
     if usd_rem is not None:
-        msg += f" (~{usd_rem:,.2f} USD; 1 USD ≈ {fmt(usd_per_usd)} UZS)"
+        msg += f" (~{usd_rem:,.2f} USD)\n(Kurs manbai: {src})"
     msg += f"\n\nBugungi yig'im: {fmt(today_saved)} so'm\n\nQuyidagi bo'limlardan birini tanlang:"
     await update.message.reply_text(msg, reply_markup=main_keyboard())
 
@@ -147,31 +173,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'add_daily':
         context.user_data['awaiting_amount'] = True
-        await query.message.reply_text("Iltimos bugungi yig'ilgan summani so'mda raqam sifatida yuboring (masalan: 40000). /cancel bilan bekor qilish mumkin.", reply_markup=back_keyboard())
+        await query.message.reply_text("Iltimos bugungi yig'ilgan summani so'mda raqam sifatida yuboring (masalan: 40000). /cancel bilan bekor qilishingiz mumkin.", reply_markup=back_keyboard())
         return
     if data == 'balance':
         total = get_total()
-        target, _ = get_settings()
+        target, _ , _ = get_settings()
         rem = max(0, target - total)
-        rate = fetch_usd_rate()
-        usd_rem = rem * rate if rate else None
+        rate, src = get_best_rate()
+        usd_rem = (rem / rate) if rate else None
         msg = f"💰 Umumiy balans:\nJami yig'ilgan: {fmt(total)} so'm\nQolgan: {fmt(rem)} so'm"
         if usd_rem is not None:
-            msg += f"\n(~{usd_rem:,.2f} USD)"
+            msg += f"\n(~{usd_rem:,.2f} USD)\n(Kurs manbai: {src})"
         await query.message.reply_text(msg, reply_markup=back_keyboard())
         return
     if data == 'rate':
-        r = fetch_usd_rate()
-        if r is not None:
-            await query.message.reply_text(f"💱 Valyuta kursi:\n1 UZS = {r:.8f} USD\n1 USD ≈ {fmt(1/r)} UZS", reply_markup=back_keyboard())
+        rate, src = get_best_rate()
+        if rate is not None:
+            await query.message.reply_text(f"💱 Valyuta kursi (Namangan/mahalliy uchun ishlatish uchun):\n1 USD ≈ {fmt(rate)} UZS\nManba: {src}", reply_markup=back_keyboard())
         else:
-            await query.message.reply_text("Kursni olishda xatolik yuz berdi.", reply_markup=back_keyboard())
+            await query.message.reply_text("Kursni olishda xatolik yuz berdi. Siz /setrate orqali o'zingiz qo'lda kurs kiritishingiz mumkin.", reply_markup=back_keyboard())
         return
     if data == 'back_main':
         await query.message.reply_text("Bosh menyu:", reply_markup=main_keyboard())
         return
     if data == 'plan_pdf':
-        # generate 1-year plan PDF and send
         await query.message.reply_text("PDF reja yaratilmoqda, biroz kuting...")
         pdf_path = generate_plan_pdf()
         if pdf_path:
@@ -182,11 +207,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # cancel handling
     txt = update.message.text.strip()
     if txt.lower() == '/cancel':
         context.user_data['awaiting_amount'] = False
         await update.message.reply_text("Amal bekor qilindi.", reply_markup=main_keyboard())
+        return
+
+    # allow /setrate <UZS_per_USD> to manually set local Namangan rate
+    if txt.startswith('/setrate'):
+        parts = txt.split()
+        if len(parts) == 2:
+            try:
+                val = float(parts[1])
+                set_local_rate(val)
+                await update.message.reply_text(f"Mahalliy kurs o'rnatildi: 1 USD ≈ {fmt(val)} UZS", reply_markup=main_keyboard())
+            except:
+                await update.message.reply_text("Xato format. Masalan: /setrate 12500", reply_markup=main_keyboard())
+        else:
+            await update.message.reply_text("Iltimos: /setrate 12500 ko'rinishida bering", reply_markup=main_keyboard())
         return
 
     if context.user_data.get('awaiting_amount'):
@@ -198,19 +236,18 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today = date.today().isoformat()
         new_total_today = inc_entry_for(today, amt)
         total = get_total()
-        target, _ = get_settings()
+        target, _ , _ = get_settings()
         rem = max(0, target - total)
-        rate = fetch_usd_rate()
-        usd_rem = rem * rate if rate else None
+        rate, src = get_best_rate()
+        usd_rem = (rem / rate) if rate else None
         msg = f"✅ +{fmt(amt)} so'm qo'shildi.\nBugungi jami: {fmt(new_total_today)} so'm\nJami yig'ilgan: {fmt(total)} so'm\nMaqsaddan qolgan: {fmt(rem)} so'm"
         if usd_rem is not None:
-            msg += f"\n(~{usd_rem:,.2f} USD)"
+            msg += f"\n(~{usd_rem:,.2f} USD; Manba: {src})"
         context.user_data['awaiting_amount'] = False
-        # after adding, automatically return to main menu
+        # automatic return to main
         await update.message.reply_text(msg, reply_markup=main_keyboard())
         return
 
-    # if not awaiting, show help
     await update.message.reply_text("Bosh menyu:", reply_markup=main_keyboard())
 
 async def settarget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,7 +274,6 @@ async def setstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def generate_plan_pdf():
     try:
-        # create a simple PDF plan using reportlab
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -245,12 +281,11 @@ def generate_plan_pdf():
 
         pdf_path = 'saving_plan_1year.pdf'
         init_db()
-        target, start_iso = get_settings()
+        target, start_iso, _ = get_settings()
         total = get_total()
         rem = max(0, target - total)
         start = date.fromisoformat(start_iso)
         end = start + timedelta(days=365)
-        # collect working days (exclude Sundays)
         days = []
         d = start
         while d <= end:
@@ -258,18 +293,16 @@ def generate_plan_pdf():
                 days.append(d)
             d += timedelta(days=1)
         per_day = rem // len(days) if len(days)>0 else rem
-        # build PDF
         doc = SimpleDocTemplate(pdf_path, pagesize=A4)
         styles = getSampleStyleSheet()
         story = []
         story.append(Paragraph("1 Yillik Yig'im Rejasi", styles['Title']))
         story.append(Spacer(1,12))
         story.append(Paragraph(f"Maqsad: {fmt(target)} so'm", styles['Normal']))
-        story.append(Paragraph(f"Jami yig'ilgan hozir: {fmt(total)} so'm", styles['Normal']))
+        story.append(Paragraph(f"Jami yig'ilgan: {fmt(total)} so'm", styles['Normal']))
         story.append(Paragraph(f"Qolgan: {fmt(rem)} so'm", styles['Normal']))
         story.append(Paragraph(f"Har ishchi kunga tavsiya: {fmt(per_day)} so'm", styles['Normal']))
         story.append(Spacer(1,12))
-        # table header
         rows = [['Sana','Hafta kuni','Tavsiya (so\'m)']]
         for d in days:
             rows.append([d.isoformat(), d.strftime('%A'), fmt(per_day)])
